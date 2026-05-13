@@ -1,0 +1,762 @@
+# ---------------------------
+# 6. gtsummary table for all commodity prices
+# ---------------------------
+# Ensure Staff_Vali is a factor for stratification
+price_clean <- price_clean %>%
+  mutate(Staff_Vali = as.factor(Staff_Vali))
+
+# Summary of price by commodity, stratified by Staff_Vali
+summary_tbl <- price_clean %>%
+  group_by(commodity) %>%
+  tbl_summary(
+    by      = Staff_Vali,
+    include = price,
+    statistic = list(all_continuous() ~ "{mean} ({sd})"),
+    digits = list(all_continuous() ~ 2)
+  ) %>%
+  modify_header(label ~ "**Commodity**") %>%
+  bold_labels()
+
+# Convert to gt table and export (HTML example)
+summary_tbl_gt <- summary_tbl %>% as_gt()
+
+gtsave(summary_tbl_gt, filename = "commodity_price_summary.html")
+
+# (If you want Word, you can also do, if officer/flextable are installed:)
+# library(flextable)
+# library(officer)
+# summary_tbl_flex <- summary_tbl %>% as_flex_table()
+# read_docx() %>%
+#   body_add_flextable(summary_tbl_flex) %>%
+#   print(target = "commodity_price_summary.docx")
+
+# ---------------------------
+# 7. Daily, weekly, monthly averages by Staff_Vali
+# ---------------------------
+
+# DAILY averages
+daily_avg <- price_clean %>%
+  group_by(Staff_Vali, commodity, date) %>%
+  summarise(
+    mean_price = mean(price, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+# WEEKLY averages (week starting Monday; change week_start if needed)
+weekly_avg <- price_clean %>%
+  mutate(week = floor_date(date, unit = "week", week_start = 1)) %>%
+  group_by(Staff_Vali, commodity, week) %>%
+  summarise(
+    mean_price = mean(price, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+# MONTHLY averages
+monthly_avg <- price_clean %>%
+  mutate(month = floor_date(date, unit = "month")) %>%
+  group_by(Staff_Vali, commodity, month) %>%
+  summarise(
+    mean_price = mean(price, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+# ---------------------------
+# 8. Correlation matrices between Staff_Vali = 0 and 1
+#    using daily, weekly, and monthly average data
+# ---------------------------
+# Helper: function to build a correlation matrix where columns are
+# mean prices by (commodity, Staff_Vali), and rows are time periods
+
+make_corr_matrix <- function(agg_data, time_var) {
+  # agg_data has: Staff_Vali, commodity, time_var, mean_price
+  wide_data <- agg_data %>%
+    mutate(
+      Staff_Vali = as.character(Staff_Vali),
+      col_name   = paste(commodity, Staff_Vali, sep = "_")
+    ) %>%
+    select(all_of(time_var), col_name, mean_price) %>%
+    pivot_wider(
+      names_from  = col_name,
+      values_from = mean_price
+    )
+  
+  # Remove the time column before correlation
+  mat <- wide_data %>%
+    select(-all_of(time_var)) %>%
+    as.matrix()
+  
+  cor(mat, use = "pairwise.complete.obs")
+}
+
+# DAILY correlation matrix
+corr_daily <- make_corr_matrix(
+  agg_data = daily_avg,
+  time_var = "date"
+)
+
+# WEEKLY correlation matrix
+corr_weekly <- make_corr_matrix(
+  agg_data = weekly_avg,
+  time_var = "week"
+)
+
+# MONTHLY correlation matrix
+corr_monthly <- make_corr_matrix(
+  agg_data = monthly_avg,
+  time_var = "month"
+)
+
+# corr_daily, corr_weekly, and corr_monthly now contain the 3 correlation matrices
+# Columns/rows are named like "White Maize_0", "White Maize_1", etc.
+
+
+
+# ============================
+# 8. CORRELATION HEATMAPS WITH LABELS
+#     - Staff_Vali = 0 on Y-axis
+#     - Staff_Vali = 1 on X-axis
+# ============================
+
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+# Helper: compute correlation matrix with STAFF 0 variables (rows) and STAFF 1 variables (columns)
+make_cross_corr_matrix <- function(agg_data, time_var) {
+  
+  wide <- agg_data %>%
+    mutate(
+      Staff_Vali = as.character(Staff_Vali),
+      new_name = paste(commodity, Staff_Vali, sep = "_")
+    ) %>%
+    select(all_of(time_var), new_name, mean_price) %>%
+    pivot_wider(
+      names_from = new_name,
+      values_from = mean_price
+    )
+  
+  # Split into 0 and 1 matrices
+  mat0 <- wide %>% select(ends_with("_0")) %>% as.matrix()
+  mat1 <- wide %>% select(ends_with("_1")) %>% as.matrix()
+  
+  cross_cor <- matrix(NA, ncol(mat0), ncol(mat1))
+  rownames(cross_cor) <- colnames(mat0)
+  colnames(cross_cor) <- colnames(mat1)
+  
+  for (i in seq_len(ncol(mat0))) {
+    for (j in seq_len(ncol(mat1))) {
+      cross_cor[i, j] <- cor(mat0[, i], mat1[, j], use = "pairwise.complete.obs")
+    }
+  }
+  return(cross_cor)
+}
+
+# Convert matrix to long format
+corr_to_long <- function(cmat) {
+  as.data.frame(cmat) %>%
+    mutate(Y = rownames(cmat)) %>%
+    pivot_longer(
+      cols = -Y,
+      names_to = "X",
+      values_to = "corr"
+    )
+}
+
+# Heatmap with labels
+plot_heatmap <- function(df_long, title_text) {
+  ggplot(df_long, aes(x = X, y = Y, fill = corr)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f", corr)), size = 3.5, color = "black") +
+    scale_fill_gradient2(
+      low = "orange",
+      high = "green",
+      mid = "lightblue",
+      midpoint = 0,
+      limit = c(-1, 1),
+      name = "Correlation"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 60, hjust = 1, size = 10),
+      axis.text.y = element_text(size = 10),
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+    ) +
+    labs(
+      x = "Commodity Prices (Staff_Vali = 1)",
+      y = "Commodity Prices (Staff_Vali = 0)",
+      title = title_text
+    )
+}
+
+# ---------------------------
+# Compute cross-correlation matrices
+# ---------------------------
+
+corr_daily    <- make_cross_corr_matrix(daily_avg, "date")
+corr_weekly   <- make_cross_corr_matrix(weekly_avg, "week")
+corr_monthly  <- make_cross_corr_matrix(monthly_avg, "month")
+
+df_daily   <- corr_to_long(corr_daily)
+df_weekly  <- corr_to_long(corr_weekly)
+df_monthly <- corr_to_long(corr_monthly)
+
+# ---------------------------
+# Heatmaps with labels
+# ---------------------------
+
+heat_daily <- plot_heatmap(df_daily,
+                           "Cross-Correlation of Commodity Prices (Daily Averages)\nStaff_Vali: 0 vs 1")
+
+heat_weekly <- plot_heatmap(df_weekly,
+                            "Cross-Correlation of Commodity Prices (Weekly Averages)\nStaff_Vali: 0 vs 1")
+
+heat_monthly <- plot_heatmap(df_monthly,
+                             "Cross-Correlation of Commodity Prices (Monthly Averages)\nStaff_Vali: 0 vs 1")
+
+# Display plots
+print(heat_daily)
+print(heat_weekly)
+print(heat_monthly)
+
+# Optional saving
+# ggsave("heat_daily_labels.png", heat_daily, width=10, height=7, dpi=300)
+# ggsave("heat_weekly_labels.png", heat_weekly, width=10, height=7, dpi=300)
+# ggsave("heat_monthly_labels.png", heat_monthly, width=10, height=7, dpi=300)
+
+
+
+
+# ============================
+# 8. CORRELATION HEATMAPS WITH:
+#    - Bold diagonal labels
+#    - Thick black border around diagonal tiles
+#    - Clean commodity names on axes
+# ============================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# Helper: compute cross-correlation matrix (0 on Y-axis, 1 on X-axis)
+make_cross_corr_matrix <- function(agg_data, time_var) {
+  
+  wide <- agg_data %>%
+    mutate(
+      Staff_Vali = as.character(Staff_Vali),
+      new_name = paste(commodity, Staff_Vali, sep = "_")
+    ) %>%
+    select(all_of(time_var), new_name, mean_price) %>%
+    pivot_wider(names_from = new_name, values_from = mean_price)
+  
+  mat0 <- wide %>% select(ends_with("_0")) %>% as.matrix()
+  mat1 <- wide %>% select(ends_with("_1")) %>% as.matrix()
+  
+  cross_cor <- matrix(NA, ncol(mat0), ncol(mat1))
+  rownames(cross_cor) <- colnames(mat0)
+  colnames(cross_cor) <- colnames(mat1)
+  
+  for (i in seq_len(ncol(mat0))) {
+    for (j in seq_len(ncol(mat1))) {
+      cross_cor[i, j] <- cor(mat0[, i], mat1[, j], use = "pairwise.complete.obs")
+    }
+  }
+  return(cross_cor)
+}
+
+# Convert matrix to long format with diagonal ID
+corr_to_long <- function(cmat) {
+  as.data.frame(cmat) %>%
+    mutate(Y = rownames(cmat)) %>%
+    pivot_longer(
+      cols = -Y,
+      names_to = "X",
+      values_to = "corr"
+    ) %>%
+    mutate(
+      commodity_Y = str_remove(Y, "_0$"),
+      commodity_X = str_remove(X, "_1$"),
+      is_diagonal = commodity_Y == commodity_X
+    )
+}
+
+# Heatmap with:
+#   - bold diagonal text
+#   - thick borders around diagonal tiles
+plot_heatmap <- function(df_long, title_text) {
+  
+  ggplot(df_long, aes(x = commodity_X, y = commodity_Y, fill = corr)) +
+    
+    # Base tiles
+    geom_tile(color = "white") +
+    
+    # THICK BORDER around diagonal tile
+    geom_tile(
+      data = df_long %>% filter(is_diagonal),
+      color = "darkgreen",
+      lwd = 1.2,        # thickness of the border
+      fill = NA          # keep original fill below
+    ) +
+    
+    # TEXT (bold on diagonal)
+    geom_text(
+      aes(
+        label = sprintf("%.2f", corr),
+        fontface = ifelse(is_diagonal, "bold", "plain")
+      ),
+      size = 3.8,
+      color = "black"
+    ) +
+    
+    scale_fill_gradient2(
+      low = "orange",
+      high = "green",
+      mid = "lightblue",
+      midpoint = 0,
+      limit = c(-1, 1),
+      name = "Correlation"
+    ) +
+    
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 60, hjust = 1, size = 12, face="italic"),
+      axis.text.y = element_text(size = 12, face = "italic"),
+      plot.title  = element_text(size = 12, face = "bold", hjust = 0.5)
+    ) +
+    
+    labs(
+      x = "Commodity Prices from Enumerators",
+      y = "Commodity Prices from Volunteer Crowd",
+      title = title_text, size = 14, face="bold"
+    )
+}
+
+# ---------------------------
+# Build matrices + long data
+# ---------------------------
+
+corr_daily    <- make_cross_corr_matrix(daily_avg, "date")
+corr_weekly   <- make_cross_corr_matrix(weekly_avg, "week")
+corr_monthly  <- make_cross_corr_matrix(monthly_avg, "month")
+
+df_daily   <- corr_to_long(corr_daily)
+df_weekly  <- corr_to_long(corr_weekly)
+df_monthly <- corr_to_long(corr_monthly)
+
+# ---------------------------
+# Heatmaps with bold diagonal + thick border
+# ---------------------------
+
+heat_daily <- plot_heatmap(df_daily,
+                           "Cross-Correlation of Commodity Prices (Daily Averages)")
+
+heat_weekly <- plot_heatmap(df_weekly,
+                            "Cross-Correlation of Commodity Prices (Weekly Averages)")
+
+heat_monthly <- plot_heatmap(df_monthly,
+                             "Cross-Correlation of Commodity Prices (Monthly Averages)")
+
+# Display plots
+print(heat_daily)
+print(heat_weekly)
+print(heat_monthly)
+
+
+
+
+
+####Creating OHLC overlaid with Crowd and FPMA data
+
+
+
+##For raw AI_data
+AI_data<-read.csv("RTP_data_7mth.csv")
+AI_data<- subset(AI_data, subset=mkt_name %in% c("North Central", "North West", "South East", "South South", "South West")) #select data for market average
+AI_data$Date<-as.Date(AI_data$Date, format = "%m/%d/%Y")
+AI_data<-data.frame(AI_data, month = month(AI_data$Date, label=TRUE))
+
+#Maize
+
+mze_AI<- subset(AI_data, Commodity=="Maize")
+mze_AI<-data.frame(mze_AI, month = month(mze_AI$Date, label=TRUE))
+
+##Note that this wasn't useful to fix the problem with the OHLC spine...so can ignore.
+mze_AI_avg<- mze_AI %>%
+  group_by(Date) %>%
+  summarize(Open = mean(Open, na.rm = TRUE),
+            Close = mean(Close, na.rm = TRUE),
+            High = mean(High, na.rm = TRUE),
+            Low = mean(Low, na.rm = TRUE)) #Daily averages per commodity
+
+
+#For FPMA raw data
+
+fpma <-read.csv("Raw_datasets_RTP/FAO_Full_Groundtruth_Geopol_long.csv")
+
+fpma <- fpma %>%
+  mutate(Date = as.Date(Date, format = "%m/%d/%Y"))
+fpma<-subset(fpma, fpma$Date >= "2024-12-01" & fpma$Date <= "2025-08-01")
+fpma<- subset(fpma, subset=ZONELABEL1 %in% c("North Central", "North West", "South East", "South South", "South West")) #select data for market average
+
+mze_fpma<-subset(fpma,Commodity=="Maize")
+
+###Non-faceted with OHLC for the AI data
+
+
+
+mze_AI_OHLC <- as.data.frame(mze_AI %>%
+                                group_by(Date) %>%
+                                summarize(Open = mean(Open, na.rm = TRUE),
+                                          Low = mean(Low, na.rm = TRUE),
+                                          High = mean(High, na.rm = TRUE),
+                                          Close = mean(Close, na.rm = TRUE)))
+
+
+# Create a column for monthly change (assuming you have a column named 'monthly_change' in mze_AI)
+mze_AI_OHLC$monthly_change <- ifelse(Cl(mze_AI_OHLC) > Op(mze_AI_OHLC), "up", "down")
+mze_AI_OHLC$monthly_change <- factor(mze_AI_OHLC$monthly_change, levels = c("up", "down"))
+
+
+#From cleaned price data in first code for data cleaning
+
+crd_data <- price_clean %>%
+  group_by(Date, commodity,ZONELABEL1) %>%
+  summarize(price_avg = mean(price, na.rm = TRUE)) #Daily averages per commodity
+
+mze_crd<-subset(crd_data, commodity=="White Maize")
+mze_crd<- subset(mze_crd, subset=ZONELABEL1 %in% c("North Central", "North West", "South East", "South South", "South West")) #matching with region in RTP
+
+
+###Finalized trend Chart with OHLC 
+
+ggplot() +
+  # Scatter plot for mze_crd
+  #geom_point(data = mze_crd2, aes(x = Date, y = Daily_price), color = "orange", size = 1.75, alpha = 0.9) +
+  
+  # Scatter plot for mze_enum2
+  # geom_point(data = mze_enum2, aes(x = Date, y = Enum_Price), pch = 16, color = "chartreuse4", size = 1.75, alpha = 0.9, stroke = 1) +
+  # Smooth line and confidence band for mze_enum2
+  geom_smooth(data = mze_crd, aes(x = Date, y = price_avg), method = "loess", se = TRUE, color = "orange", fill="orange", linetype = "solid", size = 1) +
+  #geom_smooth(data = mze_fpma, aes(x = Date, y = price), method = "loess", se = TRUE, color = "darkblue", fill = "darkblue", linetype = "solid", size = 1) +
+  ylim(500,3000)+
+  # OHLC bar plot for mze_AI2 with color encoding for monthly change
+  geom_segment(data = mze_AI, aes(x = Date, xend = Date, y = Low, yend = High), color = "black", alpha = 0.8, size = 1) +
+  geom_segment(data = mze_AI_OHLC, aes(x = Date, xend = Date, y = Low, yend = High, color = monthly_change), alpha = 1, size = 3) +
+  #geom_point(data = mze_AI2_OHLC, aes(x = Date, y = Open, color = monthly_change), pch = 15, size = 2.5, alpha = 0.7) +
+  #geom_point(data = mze_AI2_OHLC, aes(x = Date, y = Close, color = monthly_change), pch = 16, size = 3.5, alpha = 1, stroke = 1) +
+  
+  # Customizing axes and labels
+  labs(x = "", y = "Price per Kg (Naira)") +
+  
+  # Adding plot titles
+  ggtitle("") +
+  
+  # Adding minor ticks and showing each month on x-axis
+  scale_x_date(breaks = "1 month", labels = scales::date_format("%b %Y"), minor_breaks = "1 week") +
+  
+  # Customizing color scale
+  scale_color_manual(values = c("up" = "red", "down" = "green")) +
+  
+  # Customizing theme
+  #theme_minimal() +
+  theme(
+    text = element_text(size = 12, color = "black"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    legend.position = "none",
+    #legend.box.margin = margin(10, 0, 0, 0),
+    
+    # Remove gridlines
+    #panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    # Increase axis line thickness
+    #axis.line = element_line(size = 1.3, colour = "darkred"),
+    panel.border = element_rect(colour = "darkgrey", fill=NA, size=2)
+  )
+
+
+
+
+
+#Rice
+
+rice_AI<- subset(AI_data, Commodity=="Rice_RTP")
+rice_AI<-data.frame(rice_AI, month = month(rice_AI$Date, label=TRUE))
+
+##Note that this wasn't useful to fix the problem with the OHLC spine...so can ignore.
+rice_AI_avg<- rice_AI %>%
+  group_by(Date) %>%
+  summarize(Open = mean(Open, na.rm = TRUE),
+            Close = mean(Close, na.rm = TRUE),
+            High = mean(High, na.rm = TRUE),
+            Low = mean(Low, na.rm = TRUE)) #Daily averages per commodity
+
+
+#For FPMA
+
+rice_fpma<-subset(fpma,Commodity=="Rice")
+
+###Non-faceted with OHLC for the AI data
+
+
+rice_AI_OHLC <- as.data.frame(rice_AI %>%
+                               group_by(Date) %>%
+                               summarize(Open = mean(Open, na.rm = TRUE),
+                                         Low = mean(Low, na.rm = TRUE),
+                                         High = mean(High, na.rm = TRUE),
+                                         Close = mean(Close, na.rm = TRUE)))
+
+
+# Create a column for monthly change (assuming you have a column named 'monthly_change' in mze_AI)
+rice_AI_OHLC$monthly_change <- ifelse(Cl(rice_AI_OHLC) > Op(rice_AI_OHLC), "up", "down")
+rice_AI_OHLC$monthly_change <- factor(rice_AI_OHLC$monthly_change, levels = c("up", "down"))
+
+
+#Rice Crowd data
+
+rice_crd<-subset(crd_data, commodity=="Imported Rice")
+rice_crd<- subset(rice_crd, subset=ZONELABEL1 %in% c("North Central", "North West", "South East", "South South", "South West")) #matching with region in RTP
+
+
+###Finalized trend Chart with OHLC 
+
+ggplot() +
+  # Scatter plot for mze_crd
+  #geom_point(data = mze_crd2, aes(x = Date, y = Daily_price), color = "orange", size = 1.75, alpha = 0.9) +
+  
+  # Scatter plot for mze_enum2
+  # geom_point(data = mze_enum2, aes(x = Date, y = Enum_Price), pch = 16, color = "chartreuse4", size = 1.75, alpha = 0.9, stroke = 1) +
+  # Smooth line and confidence band for mze_enum2
+  geom_smooth(data = rice_crd, aes(x = Date, y = price_avg), method = "loess", se = TRUE, color = "orange", fill="orange", linetype = "solid", size = 1) +
+  geom_smooth(data = rice_fpma, aes(x = Date, y = price), method = "loess", se = TRUE, color = "darkblue", fill = "darkblue", linetype = "solid", size = 1) +
+  ylim(500,4000)+
+  # OHLC bar plot for mze_AI2 with color encoding for monthly change
+  geom_segment(data = rice_AI, aes(x = Date, xend = Date, y = Low, yend = High), color = "black", alpha = 0.8, size = 1) +
+  geom_segment(data = rice_AI_OHLC, aes(x = Date, xend = Date, y = Low, yend = High, color = monthly_change), alpha = 1, size = 3) +
+  #geom_point(data = mze_AI2_OHLC, aes(x = Date, y = Open, color = monthly_change), pch = 15, size = 2.5, alpha = 0.7) +
+  #geom_point(data = mze_AI2_OHLC, aes(x = Date, y = Close, color = monthly_change), pch = 16, size = 3.5, alpha = 1, stroke = 1) +
+  
+  # Customizing axes and labels
+  labs(x = "", y = "Price per Kg (Naira)") +
+  
+  # Adding plot titles
+  ggtitle("") +
+  
+  # Adding minor ticks and showing each month on x-axis
+  scale_x_date(breaks = "1 month", labels = scales::date_format("%b %Y"), minor_breaks = "1 week") +
+  
+  # Customizing color scale
+  scale_color_manual(values = c("up" = "red", "down" = "green")) +
+  
+  # Customizing theme
+  #theme_minimal() +
+  theme(
+    text = element_text(size = 12, color = "black"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    legend.position = "none",
+    #legend.box.margin = margin(10, 0, 0, 0),
+    
+    # Remove gridlines
+    #panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    # Increase axis line thickness
+    #axis.line = element_line(size = 1.3, colour = "darkred"),
+    panel.border = element_rect(colour = "darkgrey", fill=NA, size=2)
+  )
+
+
+
+
+###Yam
+
+yam_AI<- subset(AI_data, Commodity=="Yam_RTP")
+yam_AI<-data.frame(yam_AI, month = month(yam_AI$Date, label=TRUE))
+
+##Note that this wasn't useful to fix the problem with the OHLC spine...so can ignore.
+yam_AI_avg<- yam_AI %>%
+  group_by(Date) %>%
+  summarize(Open = mean(Open, na.rm = TRUE),
+            Close = mean(Close, na.rm = TRUE),
+            High = mean(High, na.rm = TRUE),
+            Low = mean(Low, na.rm = TRUE)) #Daily averages per commodity
+
+
+#For FPMA
+
+yam_fpma<-subset(fpma,Commodity=="Yam")
+
+###Non-faceted with OHLC for the AI data
+
+
+yam_AI_OHLC <- as.data.frame(yam_AI %>%
+                                group_by(Date) %>%
+                                summarize(Open = mean(Open, na.rm = TRUE),
+                                          Low = mean(Low, na.rm = TRUE),
+                                          High = mean(High, na.rm = TRUE),
+                                          Close = mean(Close, na.rm = TRUE)))
+
+
+# Create a column for monthly change (assuming you have a column named 'monthly_change' in mze_AI)
+yam_AI_OHLC$monthly_change <- ifelse(Cl(yam_AI_OHLC) > Op(yam_AI_OHLC), "up", "down")
+yam_AI_OHLC$monthly_change <- factor(yam_AI_OHLC$monthly_change, levels = c("up", "down"))
+
+
+#Yam Crowd data
+
+yam_crd<-subset(crd_data, commodity=="Yam")
+yam_crd<- subset(yam_crd, subset=ZONELABEL1 %in% c("North Central", "North West", "South East", "South South", "South West")) #matching with region in RTP
+
+
+###Finalized trend Chart with OHLC 
+
+ggplot() +
+  # Scatter plot for mze_crd
+  #geom_point(data = mze_crd2, aes(x = Date, y = Daily_price), color = "orange", size = 1.75, alpha = 0.9) +
+  
+  # Scatter plot for mze_enum2
+  # geom_point(data = mze_enum2, aes(x = Date, y = Enum_Price), pch = 16, color = "chartreuse4", size = 1.75, alpha = 0.9, stroke = 1) +
+  # Smooth line and confidence band for mze_enum2
+  geom_smooth(data = yam_crd, aes(x = Date, y = price_avg), method = "loess", se = TRUE, color = "orange", fill="orange", linetype = "solid", size = 1) +
+  #geom_smooth(data = yam_fpma, aes(x = Date, y = price), method = "loess", se = TRUE, color = "darkblue", fill = "darkblue", linetype = "solid", size = 1) +
+  ylim(500,2200)+
+  # OHLC bar plot for mze_AI2 with color encoding for monthly change
+  geom_segment(data = yam_AI, aes(x = Date, xend = Date, y = Low, yend = High), color = "black", alpha = 0.8, size = 1) +
+  geom_segment(data = yam_AI_OHLC, aes(x = Date, xend = Date, y = Low, yend = High, color = monthly_change), alpha = 1, size = 3) +
+  #geom_point(data = mze_AI2_OHLC, aes(x = Date, y = Open, color = monthly_change), pch = 15, size = 2.5, alpha = 0.7) +
+  #geom_point(data = mze_AI2_OHLC, aes(x = Date, y = Close, color = monthly_change), pch = 16, size = 3.5, alpha = 1, stroke = 1) +
+  
+  # Customizing axes and labels
+  labs(x = "", y = "Price per Kg (Naira)") +
+  
+  # Adding plot titles
+  ggtitle("") +
+  
+  # Adding minor ticks and showing each month on x-axis
+  scale_x_date(breaks = "1 month", labels = scales::date_format("%b %Y"), minor_breaks = "1 week") +
+  
+  # Customizing color scale
+  scale_color_manual(values = c("up" = "red", "down" = "green")) +
+  
+  # Customizing theme
+  #theme_minimal() +
+  theme(
+    text = element_text(size = 12, color = "black"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    legend.position = "none",
+    #legend.box.margin = margin(10, 0, 0, 0),
+    
+    # Remove gridlines
+    #panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    # Increase axis line thickness
+    #axis.line = element_line(size = 1.3, colour = "darkred"),
+    panel.border = element_rect(colour = "darkgrey", fill=NA, size=2)
+  )
+
+
+
+
+
+###Garri
+
+garri_AI<- subset(AI_data, Commodity=="Garri")
+garri_AI<-data.frame(garri_AI, month = month(garri_AI$Date, label=TRUE))
+
+##Note that this wasn't useful to fix the problem with the OHLC spine...so can ignore.
+garri_AI_avg<- garri_AI %>%
+  group_by(Date) %>%
+  summarize(Open = mean(Open, na.rm = TRUE),
+            Close = mean(Close, na.rm = TRUE),
+            High = mean(High, na.rm = TRUE),
+            Low = mean(Low, na.rm = TRUE)) #Daily averages per commodity
+
+
+#For FPMA
+
+garri_fpma<-subset(fpma,Commodity=="Garri")
+
+###Non-faceted with OHLC for the AI data
+
+
+garri_AI_OHLC <- as.data.frame(garri_AI %>%
+                               group_by(Date) %>%
+                               summarize(Open = mean(Open, na.rm = TRUE),
+                                         Low = mean(Low, na.rm = TRUE),
+                                         High = mean(High, na.rm = TRUE),
+                                         Close = mean(Close, na.rm = TRUE)))
+
+
+# Create a column for monthly change (assuming you have a column named 'monthly_change' in mze_AI)
+garri_AI_OHLC$monthly_change <- ifelse(Cl(garri_AI_OHLC) > Op(garri_AI_OHLC), "up", "down")
+garri_AI_OHLC$monthly_change <- factor(garri_AI_OHLC$monthly_change, levels = c("up", "down"))
+
+
+#Garri Crowd data
+
+garri_crd<-subset(crd_data, commodity=="Garri")
+garri_crd<- subset(garri_crd, subset=ZONELABEL1 %in% c("North Central", "North West", "South East", "South South", "South West")) #matching with region in RTP
+
+
+###Finalized trend Chart with OHLC 
+
+ggplot() +
+  # Scatter plot for mze_crd
+  #geom_point(data = garri_crd, aes(x = Date, y = price_avg), color = "orange", size = 1.75, alpha = 0.9) +
+  
+  # Scatter plot for mze_enum2
+  # geom_point(data = mze_enum2, aes(x = Date, y = Enum_Price), pch = 16, color = "chartreuse4", size = 1.75, alpha = 0.9, stroke = 1) +
+  # Smooth line and confidence band for mze_enum2
+  geom_smooth(data = garri_crd, aes(x = Date, y = price_avg), method = "loess", se = TRUE, color = "orange", fill="orange", linetype = "solid", size = 1) +
+  #geom_smooth(data = yam_fpma, aes(x = Date, y = price), method = "loess", se = TRUE, color = "darkblue", fill = "darkblue", linetype = "solid", size = 1) +
+  ylim(500,2200)+
+  # OHLC bar plot for mze_AI2 with color encoding for monthly change
+  geom_segment(data = garri_AI, aes(x = Date, xend = Date, y = Low, yend = High), color = "black", alpha = 0.8, size = 1) +
+  geom_segment(data = garri_AI_OHLC, aes(x = Date, xend = Date, y = Low, yend = High, color = monthly_change), alpha = 1, size = 3) +
+  #geom_point(data = mze_AI2_OHLC, aes(x = Date, y = Open, color = monthly_change), pch = 15, size = 2.5, alpha = 0.7) +
+  #geom_point(data = mze_AI2_OHLC, aes(x = Date, y = Close, color = monthly_change), pch = 16, size = 3.5, alpha = 1, stroke = 1) +
+  
+  # Customizing axes and labels
+  labs(x = "", y = "Price per Kg (Naira)") +
+  
+  # Adding plot titles
+  ggtitle("") +
+  
+  # Adding minor ticks and showing each month on x-axis
+  scale_x_date(breaks = "1 month", labels = scales::date_format("%b %Y"), minor_breaks = "1 week") +
+  
+  # Customizing color scale
+  scale_color_manual(values = c("up" = "red", "down" = "green")) +
+  
+  # Customizing theme
+  #theme_minimal() +
+  theme(
+    text = element_text(size = 12, color = "black"),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    legend.position = "none",
+    #legend.box.margin = margin(10, 0, 0, 0),
+    
+    # Remove gridlines
+    #panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    # Increase axis line thickness
+    #axis.line = element_line(size = 1.3, colour = "darkred"),
+    panel.border = element_rect(colour = "darkgrey", fill=NA, size=2)
+  )
