@@ -1,0 +1,855 @@
+###Code for FPMA Analysis   Part 2
+### Run the previous code to generate input data
+
+
+# ============================================
+# Correlation analysis: National Average (4 commodities)
+# ============================================
+
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(broom)
+library(scales)
+# install.packages("ggrepel") # if not installed
+library(ggrepel)
+
+# ----------------------------
+# 0) Helper: Nature-style theme
+# ----------------------------
+theme_nature <- function(base_size = 11){
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title.position = "plot",
+      plot.title = element_text(face = "bold", size = base_size + 3, margin = margin(b = 6)),
+      plot.subtitle = element_text(size = base_size + 1, margin = margin(b = 10)),
+      plot.caption = element_text(size = base_size - 1, color = "grey30"),
+      strip.text = element_text(face = "bold", size = base_size + 1),
+      axis.title = element_text(size = base_size + 1),
+      axis.text = element_text(size = base_size),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_line(linewidth = 0.2),
+      legend.position = "none"
+    )
+}
+
+# ------------------------------------------------------------
+# 1) Build monthly NATIONAL AVERAGES for both sources
+#    - Level 2: already daily → monthly by zone; aggregate across zones
+#    - FAO:     aggregate across zones to get national series
+# ------------------------------------------------------------
+
+# Ensure Date class
+Level2_data_rtl <- Level2_data_rtl %>% mutate(Date = as.Date(Date))
+fao_long           <- fao_long           %>% mutate(Date = as.Date(Date))
+
+# Ensure commodity names are the canonical four for comparison
+keep_comm <- c("White Maize", "Imported Rice", "Garri", "Yam")
+
+# Level 2 national average per month & commodity
+l2_nat <- Level2_data_rtl %>%
+  mutate(Month = floor_date(Date, "month")) %>%
+  group_by(Month, price_cate, Commodity) %>%
+  summarise(
+    L2_Price = mean(Price, na.rm = TRUE),
+    n_l2 = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  mutate(ZONELABEL1 = "National Average") %>%
+  filter(Commodity %in% keep_comm)
+
+# FAO national average per month & commodity (across zones)
+fao_nat <- fao_long %>%
+  mutate(Month = floor_date(Date, "month")) %>%
+  group_by(Month, price_cate, Commodity) %>%
+  summarise(
+    FAO_Price = mean(Price, na.rm = TRUE),
+    n_fao = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  mutate(ZONELABEL1 = "National Average") %>%
+  filter(Commodity %in% keep_comm)
+
+# Window align (optional – match your paper window)
+# Dec 2024 – Jun 2025 inclusive
+time_min <- as.Date("2024-12-01")
+time_max <- as.Date("2025-06-30")
+
+l2_nat  <- l2_nat  %>% filter(Month >= time_min, Month <= time_max)
+fao_nat <- fao_nat %>% filter(Month >= time_min, Month <= time_max)
+
+# Pair up by Month + price_cate + Commodity
+pair_nat <- inner_join(
+  l2_nat  %>% dplyr::select(Month, price_cate, Commodity, L2_Price),
+  fao_nat %>% dplyr::select(Month, price_cate, Commodity, FAO_Price),
+  by = c("Month", "price_cate", "Commodity")
+) %>%
+  mutate(Commodity = factor(Commodity, levels = keep_comm)) %>%
+  arrange(Commodity, Month)
+
+# --------------------------------------------
+# 2) Correlation stats per commodity (Pearson)
+#    with 95% CI via Fisher z-transform
+# --------------------------------------------
+cor_per_comm <- pair_nat %>%
+  group_by(Commodity) %>%
+  summarise(
+    n = sum(complete.cases(L2_Price, FAO_Price)),
+    r = if (n >= 3) cor(L2_Price, FAO_Price, use = "complete.obs", method = "pearson") else NA_real_,
+    p = if (n >= 3) cor.test(L2_Price, FAO_Price, method = "pearson")$p.value else NA_real_,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Fisher z CI
+    z = atanh(r),
+    se_z = ifelse(!is.na(r) & n > 3, 1 / sqrt(n - 3), NA_real_),
+    z_low = z - 1.96 * se_z,
+    z_high = z + 1.96 * se_z,
+    r_low = tanh(z_low),
+    r_high = tanh(z_high),
+    # Text label
+    label = ifelse(
+      is.na(r),
+      paste0("n=", n),
+      paste0(
+        "r=", sprintf("%.2f", r),
+        "  (95% CI ", sprintf("%.2f", r_low), "–", sprintf("%.2f", r_high), ")\n",
+        "p=", ifelse(p < 0.001, "<0.001", sprintf("%.3f", p)),
+        "  n=", n
+      )
+    )
+  )
+
+# --------------------------------------------
+# 3) Faceted XY plot (FAO vs Level 2), one facet/commodity
+#    - OLS fit with 95% CI
+#    - Nature-grade styling
+#    - Text annotation: r, 95% CI, p, n
+# --------------------------------------------
+
+# Axis limits per facet (optional). You can compute dynamically if needed.
+# Here we share scales across facets to emphasize calibration across commodities
+x_lim <- range(pair_nat$FAO_Price, na.rm = TRUE)
+y_lim <- range(pair_nat$L2_Price, na.rm = TRUE)
+
+p_xy <- ggplot(pair_nat, aes(x = FAO_Price, y = L2_Price)) +
+  geom_abline(slope = 1, intercept = 0, linewidth = 0.6, linetype = "dashed", color = "grey40") +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.9, color = "#1f77b4", fill = alpha("#1f77b4", 0.18)) +
+  geom_point(size = 2.4, alpha = 0.9, color = "black") +
+  facet_wrap(~ Commodity, ncol = 2, scales = "fixed") +
+  scale_x_continuous(limits = x_lim, labels = label_comma()) +
+  scale_y_continuous(limits = y_lim, labels = label_comma()) +
+  labs(
+    title = "Source Agreement at National Level: FAO vs. Level 2 Monthly Prices",
+    subtitle = "Faceted by commodity; dashed line is 1:1. OLS line with 95% confidence band.",
+    x = "FAO Ground Truth (₦/kg)",
+    y = "Level 2 (Daily → Monthly) (₦/kg)",
+    caption = "Notes: Monthly national averages computed across zones; window: Dec 2024–Jun 2025."
+  ) +
+  theme_nature(base_size = 12)
+
+# Add correlation annotations per facet
+# Choose a corner inside each panel for placement (relative coords via Inf)
+# We'll compute per-facet positions using scaled range.
+ann_df <- pair_nat %>%
+  group_by(Commodity) %>%
+  summarise(
+    x_pos = min(FAO_Price, na.rm = TRUE) + 0.05 * diff(range(FAO_Price, na.rm = TRUE)),
+    y_pos = max(L2_Price, na.rm = TRUE) - 0.05 * diff(range(L2_Price, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  left_join(cor_per_comm %>% dplyr::select(Commodity, label), by = "Commodity")
+
+p_xy <- p_xy +
+  geom_label(
+    data = ann_df,
+    aes(x = x_pos, y = y_pos, label = label),
+    size = 3.3, label.size = 0, label.r = unit(3, "pt"),
+    fill = alpha("white", 0.7)
+  )
+
+
+
+# (Optional) Print correlation table
+print(cor_per_comm)
+
+# Save high-resolution figure
+out_dir <- "fig_correlation_national"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+ggsave(
+  filename = file.path(out_dir, "correlation_FAO_vs_Level2_National.png"),
+  plot = p_xy, width = 8.5, height = 7.5, dpi = 600, bg = "white"
+)
+
+
+
+###Heat map for raw prices across States
+# ---- Packages ----
+packages <- c("dplyr", "ggplot2", "lubridate", "scales")
+to_install <- setdiff(packages, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install)
+
+# ggalign is preferred for arranging the main plot + insets
+if (!requireNamespace("ggalign", quietly = TRUE)) {
+  message("Package 'ggalign' not found. Falling back to 'patchwork' for layout.")
+  if (!requireNamespace("patchwork", quietly = TRUE)) install.packages("patchwork")
+}
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+
+# ================================
+# 1) Prepare daily averages
+# ================================
+# Expect columns:
+#   - Date (daily), STATELABEL (state), price_Wm_1 (numeric price)
+stopifnot(all(c("Date","STATELABEL","price_Wm_1") %in% names(raw_data_Wmze)))
+
+wm_daily <- raw_data_Wmze %>%
+  mutate(
+    Date = as.Date(Date),                                  # ensure Date type
+    STATELABEL = as.character(STATELABEL)
+  ) %>%
+  filter(!is.na(Date), !is.na(STATELABEL), !is.na(price_Wm_1)) %>%
+  group_by(STATELABEL, Date) %>%
+  summarise(avg_price = mean(price_Wm_1, na.rm = TRUE), .groups = "drop")
+
+# Order states by their long-run mean price (highest at top, like the sample image)
+state_order <- wm_daily %>%
+  group_by(STATELABEL) %>%
+  summarise(mu = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mu)) %>%
+  pull(STATELABEL)
+
+wm_daily <- wm_daily %>%
+  mutate(STATELABEL = factor(STATELABEL, levels = state_order))
+
+# ================================
+# 2) Build the main heatmap
+# ================================
+p_main <- ggplot(wm_daily, aes(x = Date, y = STATELABEL, fill = avg_price)) +
+  geom_tile() +
+  scale_fill_gradientn(
+    colours = c("#fefdbf", "#fbdc6f", "#fdae61", "#f46d43", "#d73027"),
+    name = "Avg price",
+    label = label_number(big.mark = ","),
+    guide = guide_colorbar(barheight = unit(80, "pt"))
+  ) +
+  labs(
+    title   = "Daily White Maize Prices by State",
+    subtitle= "Heatmap of daily state-level average prices",
+    x       = NULL,
+    y       = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.text.y   = element_text(size = 8),
+    panel.grid    = element_blank()
+  )
+
+# ================================
+# 3) Marginal (inset) histograms
+#    • Top: daily national mean price over time (as columns)
+#    • Right: distribution of state means (over the period)
+# ================================
+# Top bars (one value per Date)
+top_df <- wm_daily %>%
+  group_by(Date) %>%
+  summarise(national_mean = mean(avg_price, na.rm = TRUE), .groups = "drop")
+
+p_top <- ggplot(top_df, aes(x = Date, y = national_mean)) +
+  geom_col(width = 1, fill = "#ffd24d", color = NA) +
+  labs(x = NULL, y = NULL) +
+  theme_void() +
+  theme(
+    plot.margin = margin(b = 2),
+    panel.grid  = element_blank()
+  )
+
+# Right bars (one value per State)
+right_df <- wm_daily %>%
+  group_by(STATELABEL) %>%
+  summarise(state_mean = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  mutate(STATELABEL = factor(STATELABEL, levels = state_order))
+
+p_right <- ggplot(right_df, aes(x = state_mean, y = STATELABEL)) +
+  geom_col(fill = "#ffd24d", color = NA) +
+  labs(x = NULL, y = NULL) +
+  theme_void() +
+  theme(
+    plot.margin = margin(l = 2),
+    panel.grid  = element_blank()
+  )
+
+# ================================
+# 4) Assemble like the reference (heatmap centered, bars on top and right)
+# ================================
+if (requireNamespace("ggalign", quietly = TRUE)) {
+  library(ggalign)
+  
+  # ggalign’s layout: place top and right small panels around the main plot
+  layout <- align() |>
+    pack_top(height = 0.18) |>      # top inset height
+    pack_right(width = 0.18)        # right inset width
+  
+  out <- layout |>
+    insert(p_main) |>
+    insert(p_top,   target = "top") |>
+    insert(p_right, target = "right")
+  
+  print(out)
+  
+} else {
+  # Fallback using patchwork
+  library(patchwork)
+  
+  # relative sizes roughly mimic the sample image
+  top_row   <- p_top + plot_spacer() + plot_layout(widths = c(1, 0.18))
+  middle    <- p_main + p_right + plot_layout(widths = c(1, 0.18))
+  final_plot <- top_row / middle + plot_layout(heights = c(0.18, 1))
+  
+  print(final_plot)
+}
+
+
+
+
+###Heat map retry, without top bar
+# --- 1) Daily averages (unchanged) ---
+stopifnot(all(c("Date","STATELABEL","price_Wm_1") %in% names(raw_data_Wmze)))
+
+wm_daily <- raw_data_Wmze %>%
+  dplyr::mutate(
+    Date = as.Date(Date),
+    STATELABEL = as.character(STATELABEL)
+  ) %>%
+  dplyr::filter(!is.na(Date), !is.na(STATELABEL), !is.na(price_Wm_1)) %>%
+  dplyr::group_by(STATELABEL, Date) %>%
+  dplyr::summarise(avg_price = mean(price_Wm_1, na.rm = TRUE), .groups = "drop")
+
+state_order <- wm_daily %>%
+  dplyr::group_by(STATELABEL) %>%
+  dplyr::summarise(mu = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(desc(mu)) %>%
+  dplyr::pull(STATELABEL)
+
+wm_daily <- wm_daily %>%
+  dplyr::mutate(STATELABEL = factor(STATELABEL, levels = state_order))
+
+# --- 2) Main heatmap (legend at bottom, horizontal) ---
+p_main <- ggplot2::ggplot(wm_daily, aes(x = Date, y = STATELABEL, fill = avg_price)) +
+  ggplot2::geom_tile() +
+  ggplot2::scale_fill_gradientn(
+    colours = c("#fefdbf", "#fbdc6f", "#fdae61", "#f46d43", "#d73027"),
+    name     = "Avg price",
+    label    = scales::label_number(big.mark = ","),
+    guide    = ggplot2::guide_colorbar(
+      direction = "horizontal",
+      barwidth  = grid::unit(140, "pt"),
+      barheight = grid::unit(6, "pt"),
+      title.position = "top"
+    )
+  ) +
+  ggplot2::labs(
+    title    = "Daily White Maize Prices by State",
+    subtitle = "Heatmap of daily state-level average prices",
+    x = NULL, y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title    = ggplot2::element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = ggplot2::element_text(hjust = 0.5),
+    axis.text.y   = ggplot2::element_text(size = 8),
+    panel.grid    = ggplot2::element_blank(),
+    legend.position   = "bottom",
+    legend.direction  = "horizontal",
+    legend.box        = "horizontal",
+    legend.title      = ggplot2::element_text(size = 10, face = "bold"),
+    legend.text       = ggplot2::element_text(size = 9)
+  )
+
+# --- 3) Right inset bars (state means) ---
+right_df <- wm_daily %>%
+  dplyr::group_by(STATELABEL) %>%
+  dplyr::summarise(state_mean = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(STATELABEL = factor(STATELABEL, levels = state_order))
+
+p_right <- ggplot2::ggplot(right_df, aes(x = state_mean, y = STATELABEL)) +
+  ggplot2::geom_col(fill = "#ffd24d", color = NA) +
+  ggplot2::scale_x_continuous(labels = scales::label_number(big.mark = ",")) +
+  ggplot2::labs(x = "Price (₦/kg)", y = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    # show x-axis ticks & labels; hide y text (states already shown in heatmap)
+    axis.text.x  = ggplot2::element_text(size = 8),
+    axis.title.x = ggplot2::element_text(size = 10, face = "bold", margin = ggplot2::margin(t = 4)),
+    axis.text.y  = ggplot2::element_blank(),
+    axis.ticks.y = ggplot2::element_blank(),
+    panel.grid.major.y = ggplot2::element_blank(),
+    legend.position = "none",
+    #plot.margin = grid::margin(l = 4, t = 2, b = 2, r = 2)
+  )
+
+# --- 4) Assemble WITHOUT the top bar; legend stays under the main plot ---
+if (requireNamespace("ggalign", quietly = TRUE)) {
+  library(ggalign)
+  layout <- align() |> pack_right(width = 0.18)  # only right inset
+  out <- layout |> insert(p_main) |> insert(p_right, target = "right")
+  print(out)
+} else {
+  library(patchwork)
+  final_plot <- p_main + p_right + plot_layout(widths = c(1, 0.18))
+  print(final_plot)
+}
+
+
+
+#Heatmap White Maize - WITHOUT REGIONAL CATEGORY
+
+# --- 1) Daily averages (unchanged) ---
+stopifnot(all(c("Date","STATELABEL","price_Wm_1") %in% names(raw_data_Wmze)))
+
+wm_daily <- raw_data_Wmze %>%
+  dplyr::mutate(
+    Date = as.Date(Date),
+    STATELABEL = as.character(STATELABEL)
+  ) %>%
+  dplyr::filter(!is.na(Date), !is.na(STATELABEL), !is.na(price_Wm_1)) %>%
+  dplyr::group_by(STATELABEL, Date) %>%
+  dplyr::summarise(avg_price = mean(price_Wm_1, na.rm = TRUE), .groups = "drop")
+
+state_order <- wm_daily %>%
+  dplyr::group_by(STATELABEL) %>%
+  dplyr::summarise(mu = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(desc(mu)) %>%
+  dplyr::pull(STATELABEL)
+
+wm_daily <- wm_daily %>%
+  dplyr::mutate(STATELABEL = factor(STATELABEL, levels = state_order))
+
+# --- 2) Main heatmap (legend at bottom, horizontal) ---
+p_main <- ggplot2::ggplot(wm_daily, aes(x = Date, y = STATELABEL, fill = avg_price)) +
+  ggplot2::geom_tile() +
+  # show every month on the heatmap x-axis
+  ggplot2::scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  ggplot2::scale_fill_gradientn(
+    colours = c("#fefdbf", "#fbdc6f", "#fdae61", "#f46d43", "#d73027"),
+    name     = "Avg Price (₦/kg)",
+    label    = scales::label_number(big.mark = ","),
+    guide    = ggplot2::guide_colorbar(
+      direction = "horizontal",
+      barwidth  = grid::unit(160, "pt"),
+      barheight = grid::unit(8, "pt"),
+      title.position = "top"
+    )
+  ) +
+  ggplot2::labs(
+    title    = "Daily White Maize Prices by State",
+    subtitle = "Heatmap of daily state-level average prices",
+    x = NULL, y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title    = ggplot2::element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = ggplot2::element_text(hjust = 0.5),
+    # Match x and y tick label sizes
+    axis.text.x   = ggplot2::element_text(size = 10),
+    axis.text.y   = ggplot2::element_text(size = 10),
+    panel.grid    = ggplot2::element_blank(),
+    legend.position   = "bottom",
+    legend.direction  = "horizontal",
+    legend.box        = "horizontal",
+    # Bigger legend label fonts
+    legend.title      = ggplot2::element_text(size = 12, face = "bold"),
+    legend.text       = ggplot2::element_text(size = 11)
+  )
+
+# --- 3) Right inset bars (state means) — no grid, 4 x-axis labels ---
+right_df <- wm_daily %>%
+  dplyr::group_by(STATELABEL) %>%
+  dplyr::summarise(state_mean = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(STATELABEL = factor(STATELABEL, levels = state_order))
+
+p_right <- ggplot2::ggplot(right_df, aes(x = state_mean, y = STATELABEL)) +
+  ggplot2::geom_col(fill = "#ffd24d", color = NA) +
+  ggplot2::scale_x_continuous(
+    labels = scales::label_number(big.mark = ","),
+    breaks = scales::pretty_breaks(n = 3)   # ~4 intervals
+  ) +
+  ggplot2::labs(x = "Price (₦/kg)", y = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    axis.text.x  = ggplot2::element_text(size = 10),
+    axis.title.x = ggplot2::element_text(size = 10, face = "bold", margin = ggplot2::margin(t = 4)),
+    axis.text.y  = ggplot2::element_blank(),
+    axis.ticks.y = ggplot2::element_blank(),
+    # remove ALL gridlines on the right bar plot
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    legend.position = "none",
+    #plot.margin = grid::margin(l = 2, t = 2, b = 2, r = 2)
+  )
+
+# --- 4) Assemble without top bar; halve the gap between panels ---
+if (requireNamespace("ggalign", quietly = TRUE)) {
+  library(ggalign)
+  layout <- align() |> pack_right(width = 0.18)  # was 0.18; now half
+  out <- layout |> insert(p_main) |> insert(p_right, target = "right")
+  print(out)
+} else {
+  library(patchwork)
+  final_plot <- p_main + p_right + plot_layout(widths = c(1, 0.18))  # was 0.18; now half
+  print(final_plot)
+}
+
+
+
+
+#####Heatmap final White Maize — grouped by geopolitical zones (ZONELABEL1)
+
+# --- 1) Daily averages (now keeping ZONELABEL1) ---
+stopifnot(all(c("Date","STATELABEL","price_Wm_1","ZONELABEL1") %in% names(raw_data_Wmze)))
+
+wm_daily <- raw_data_Wmze %>%
+  dplyr::mutate(
+    Date = as.Date(Date),
+    STATELABEL  = as.character(STATELABEL),
+    ZONELABEL1  = as.character(ZONELABEL1)
+  ) %>%
+  dplyr::filter(!is.na(Date), !is.na(STATELABEL), !is.na(ZONELABEL1), !is.na(price_Wm_1)) %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL, Date) %>%
+  dplyr::summarise(avg_price = mean(price_Wm_1, na.rm = TRUE), .groups = "drop")
+
+# Order states *within each zone* by their long-run mean price (desc)
+state_order_tbl <- wm_daily %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL) %>%
+  dplyr::summarise(mu = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(ZONELABEL1, dplyr::desc(mu)) %>%
+  dplyr::group_by(ZONELABEL1) %>%
+  dplyr::mutate(order_in_zone = dplyr::row_number())
+
+# Create a single global factor order that preserves zone blocks
+state_levels_global <- state_order_tbl %>%
+  dplyr::arrange(ZONELABEL1, order_in_zone) %>%
+  dplyr::pull(STATELABEL) %>%
+  unique()
+
+wm_daily <- wm_daily %>%
+  dplyr::mutate(
+    STATELABEL = factor(STATELABEL, levels = state_levels_global),
+    ZONELABEL1 = factor(ZONELABEL1)  # keep zone order as it appears; set levels manually if needed
+  )
+
+# --- 2) Main heatmap (legend at bottom, horizontal), faceted by zone in rows ---
+p_main <- ggplot2::ggplot(wm_daily, aes(x = Date, y = STATELABEL, fill = avg_price)) +
+  ggplot2::geom_tile() +
+  ggplot2::facet_grid(rows = vars(ZONELABEL1), scales = "free_y", space = "free_y") +
+  ggplot2::scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  ggplot2::scale_fill_gradientn(
+    colours = c("#fefdbf", "#fbdc6f", "#fdae61", "#f46d43", "#d73027"),
+    name     = "Average Daily Price (₦/kg)",
+    label    = scales::label_number(big.mark = ","),
+    guide    = ggplot2::guide_colorbar(
+      direction = "horizontal",
+      barwidth  = grid::unit(160, "pt"),
+      barheight = grid::unit(8, "pt"),
+      title.position = "top"
+    )
+  ) +
+  ggplot2::labs(
+    title    = "Daily White Maize Prices by State",
+    subtitle = "Heatmap of daily state-level average prices grouped by geopolitical zone",
+    x = NULL, y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title    = ggplot2::element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = ggplot2::element_text(hjust = 0.5),
+    axis.text.x   = ggplot2::element_text(size = 10),
+    axis.text.y   = ggplot2::element_text(size = 10),
+    panel.grid    = ggplot2::element_blank(),
+    strip.text.y  = ggplot2::element_text(face = "italic"),   # zone labels
+    legend.position   = "bottom",
+    legend.direction  = "horizontal",
+    legend.box        = "horizontal",
+    legend.title      = ggplot2::element_text(size = 12, face = "bold"),
+    legend.text       = ggplot2::element_text(size = 11)
+  )
+
+# --- 3) Right inset bars (state means), faceted by the same zones ---
+right_df <- wm_daily %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL) %>%
+  dplyr::summarise(state_mean = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(
+    STATELABEL = factor(STATELABEL, levels = state_levels_global),
+    ZONELABEL1 = factor(ZONELABEL1, levels = levels(wm_daily$ZONELABEL1))
+  )
+
+p_right <- ggplot2::ggplot(right_df, aes(x = state_mean, y = STATELABEL)) +
+  ggplot2::geom_col(fill = "#ffd24d", color = NA) +
+  ggplot2::facet_grid(rows = vars(ZONELABEL1), scales = "free_y", space = "free_y") +
+  ggplot2::scale_x_continuous(
+    labels = scales::label_number(big.mark = ","),
+    breaks = scales::pretty_breaks(n = 3)  # ~4 intervals
+  ) +
+  ggplot2::labs(x = "Average Price (₦/kg)", y = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    axis.text.x  = ggplot2::element_text(size = 10),
+    axis.title.x = ggplot2::element_text(size = 10, face = "bold", margin = ggplot2::margin(t = 4)),
+    axis.text.y  = ggplot2::element_blank(),
+    axis.ticks.y = ggplot2::element_blank(),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    strip.text.y  = ggplot2::element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+# --- 4) Assemble (no top bar); same right inset width as before ---
+if (requireNamespace("ggalign", quietly = TRUE)) {
+  library(ggalign)
+  layout <- align() |> pack_right(width = 0.18)
+  out <- layout |> insert(p_main) |> insert(p_right, target = "right")
+  print(out)
+} else {
+  library(patchwork)
+  final_plot <- p_main + p_right + plot_layout(widths = c(1, 0.18))
+  print(final_plot)
+}
+
+
+
+
+#####Heatmap final Yam — grouped by geopolitical zones (ZONELABEL1)
+
+# --- 1) Daily averages (now keeping ZONELABEL1) ---
+stopifnot(all(c("Date","STATELABEL","price_yam_","ZONELABEL1") %in% names(raw_data_yam)))
+
+yam_daily <- raw_data_yam %>%
+  dplyr::mutate(
+    Date = as.Date(Date),
+    STATELABEL  = as.character(STATELABEL),
+    ZONELABEL1  = as.character(ZONELABEL1)
+  ) %>%
+  dplyr::filter(!is.na(Date), !is.na(STATELABEL), !is.na(ZONELABEL1), !is.na(price_yam_)) %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL, Date) %>%
+  dplyr::summarise(avg_price = mean(price_yam_, na.rm = TRUE), .groups = "drop")
+
+# Order states *within each zone* by their long-run mean price (desc)
+state_order_tbl <- yam_daily %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL) %>%
+  dplyr::summarise(mu = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(ZONELABEL1, dplyr::desc(mu)) %>%
+  dplyr::group_by(ZONELABEL1) %>%
+  dplyr::mutate(order_in_zone = dplyr::row_number())
+
+# Create a single global factor order that preserves zone blocks
+state_levels_global <- state_order_tbl %>%
+  dplyr::arrange(ZONELABEL1, order_in_zone) %>%
+  dplyr::pull(STATELABEL) %>%
+  unique()
+
+yam_daily <- yam_daily %>%
+  dplyr::mutate(
+    STATELABEL = factor(STATELABEL, levels = state_levels_global),
+    ZONELABEL1 = factor(ZONELABEL1)  # keep zone order as it appears; set levels manually if needed
+  )
+
+# --- 2) Main heatmap (legend at bottom, horizontal), faceted by zone in rows ---
+p_main <- ggplot2::ggplot(yam_daily, aes(x = Date, y = STATELABEL, fill = avg_price)) +
+  ggplot2::geom_tile() +
+  ggplot2::facet_grid(rows = vars(ZONELABEL1), scales = "free_y", space = "free_y") +
+  ggplot2::scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  ggplot2::scale_fill_gradientn(
+    colours = c("#fefdbf", "#fbdc6f", "#fdae61", "#f46d43", "#d73027"),
+    name     = "Average Daily Price (₦/kg)",
+    label    = scales::label_number(big.mark = ","),
+    guide    = ggplot2::guide_colorbar(
+      direction = "horizontal",
+      barwidth  = grid::unit(160, "pt"),
+      barheight = grid::unit(8, "pt"),
+      title.position = "top"
+    )
+  ) +
+  ggplot2::labs(
+    title    = "Daily Yam Prices by State",
+    subtitle = "Heatmap of daily state-level average prices grouped by geopolitical zone",
+    x = NULL, y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title    = ggplot2::element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = ggplot2::element_text(hjust = 0.5),
+    axis.text.x   = ggplot2::element_text(size = 10),
+    axis.text.y   = ggplot2::element_text(size = 10),
+    panel.grid    = ggplot2::element_blank(),
+    strip.text.y  = ggplot2::element_text(face = "italic"),   # zone labels
+    legend.position   = "bottom",
+    legend.direction  = "horizontal",
+    legend.box        = "horizontal",
+    legend.title      = ggplot2::element_text(size = 12, face = "bold"),
+    legend.text       = ggplot2::element_text(size = 11)
+  )
+
+# --- 3) Right inset bars (state means), faceted by the same zones ---
+right_df <- yam_daily %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL) %>%
+  dplyr::summarise(state_mean = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(
+    STATELABEL = factor(STATELABEL, levels = state_levels_global),
+    ZONELABEL1 = factor(ZONELABEL1, levels = levels(yam_daily$ZONELABEL1))
+  )
+
+p_right <- ggplot2::ggplot(right_df, aes(x = state_mean, y = STATELABEL)) +
+  ggplot2::geom_col(fill = "#ffd24d", color = NA) +
+  ggplot2::facet_grid(rows = vars(ZONELABEL1), scales = "free_y", space = "free_y") +
+  ggplot2::scale_x_continuous(
+    labels = scales::label_number(big.mark = ","),
+    breaks = scales::pretty_breaks(n = 3)  # ~4 intervals
+  ) +
+  ggplot2::labs(x = "Average Price (₦/kg)", y = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    axis.text.x  = ggplot2::element_text(size = 10),
+    axis.title.x = ggplot2::element_text(size = 10, face = "bold", margin = ggplot2::margin(t = 4)),
+    axis.text.y  = ggplot2::element_blank(),
+    axis.ticks.y = ggplot2::element_blank(),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    strip.text.y  = ggplot2::element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+# --- 4) Assemble (no top bar); same right inset width as before ---
+if (requireNamespace("ggalign", quietly = TRUE)) {
+  library(ggalign)
+  layout <- align() |> pack_right(width = 0.18)
+  out <- layout |> insert(p_main) |> insert(p_right, target = "right")
+  print(out)
+} else {
+  library(patchwork)
+  final_plot <- p_main + p_right + plot_layout(widths = c(1, 0.18))
+  print(final_plot)
+}
+
+
+
+
+
+#Heatmap final Imported Rice
+
+# --- 1) Daily averages (now keeping ZONELABEL1) ---
+stopifnot(all(c("Date","STATELABEL","price_impo_1","ZONELABEL1") %in% names(raw_data_Irice)))
+
+ir_daily <- raw_data_Irice %>%
+  dplyr::mutate(
+    Date = as.Date(Date),
+    STATELABEL  = as.character(STATELABEL),
+    ZONELABEL1  = as.character(ZONELABEL1)
+  ) %>%
+  dplyr::filter(!is.na(Date), !is.na(STATELABEL), !is.na(ZONELABEL1), !is.na(price_impo_1)) %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL, Date) %>%
+  dplyr::summarise(avg_price = mean(price_impo_1, na.rm = TRUE), .groups = "drop")
+
+# Order states *within each zone* by their long-run mean price (desc)
+state_order_tbl <- ir_daily %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL) %>%
+  dplyr::summarise(mu = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(ZONELABEL1, dplyr::desc(mu)) %>%
+  dplyr::group_by(ZONELABEL1) %>%
+  dplyr::mutate(order_in_zone = dplyr::row_number())
+
+# Create a single global factor order that preserves zone blocks
+state_levels_global <- state_order_tbl %>%
+  dplyr::arrange(ZONELABEL1, order_in_zone) %>%
+  dplyr::pull(STATELABEL) %>%
+  unique()
+
+ir_daily <- ir_daily %>%
+  dplyr::mutate(
+    STATELABEL = factor(STATELABEL, levels = state_levels_global),
+    ZONELABEL1 = factor(ZONELABEL1)  # keep zone order as it appears; set levels manually if needed
+  )
+
+# --- 2) Main heatmap (legend at bottom, horizontal), faceted by zone in rows ---
+p_main <- ggplot2::ggplot(ir_daily, aes(x = Date, y = STATELABEL, fill = avg_price)) +
+  ggplot2::geom_tile() +
+  ggplot2::facet_grid(rows = vars(ZONELABEL1), scales = "free_y", space = "free_y") +
+  ggplot2::scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  ggplot2::scale_fill_gradientn(
+    colours = c("#fefdbf", "#fbdc6f", "#fdae61", "#f46d43", "#d73027"),
+    name     = "Average Daily Price (₦/kg)",
+    label    = scales::label_number(big.mark = ","),
+    guide    = ggplot2::guide_colorbar(
+      direction = "horizontal",
+      barwidth  = grid::unit(160, "pt"),
+      barheight = grid::unit(8, "pt"),
+      title.position = "top"
+    )
+  ) +
+  ggplot2::labs(
+    title    = "Daily Prices of Imported Rice by State",
+    subtitle = "Heatmap of daily state-level average prices grouped by geopolitical zone",
+    x = NULL, y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    plot.title    = ggplot2::element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = ggplot2::element_text(hjust = 0.5),
+    axis.text.x   = ggplot2::element_text(size = 10),
+    axis.text.y   = ggplot2::element_text(size = 10),
+    panel.grid    = ggplot2::element_blank(),
+    strip.text.y  = ggplot2::element_text(face = "italic"),   # zone labels
+    legend.position   = "bottom",
+    legend.direction  = "horizontal",
+    legend.box        = "horizontal",
+    legend.title      = ggplot2::element_text(size = 12, face = "bold"),
+    legend.text       = ggplot2::element_text(size = 11)
+  )
+
+# --- 3) Right inset bars (state means), faceted by the same zones ---
+right_df <- ir_daily %>%
+  dplyr::group_by(ZONELABEL1, STATELABEL) %>%
+  dplyr::summarise(state_mean = mean(avg_price, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(
+    STATELABEL = factor(STATELABEL, levels = state_levels_global),
+    ZONELABEL1 = factor(ZONELABEL1, levels = levels(ir_daily$ZONELABEL1))
+  )
+
+p_right <- ggplot2::ggplot(right_df, aes(x = state_mean, y = STATELABEL)) +
+  ggplot2::geom_col(fill = "#ffd24d", color = NA) +
+  ggplot2::facet_grid(rows = vars(ZONELABEL1), scales = "free_y", space = "free_y") +
+  ggplot2::scale_x_continuous(
+    labels = scales::label_number(big.mark = ","),
+    breaks = scales::pretty_breaks(n = 3)  # ~4 intervals
+  ) +
+  ggplot2::labs(x = "Average Price (₦/kg)", y = NULL) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    axis.text.x  = ggplot2::element_text(size = 10),
+    axis.title.x = ggplot2::element_text(size = 10, face = "bold", margin = ggplot2::margin(t = 4)),
+    axis.text.y  = ggplot2::element_blank(),
+    axis.ticks.y = ggplot2::element_blank(),
+    panel.grid.major = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    strip.text.y  = ggplot2::element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+# --- 4) Assemble (no top bar); same right inset width as before ---
+if (requireNamespace("ggalign", quietly = TRUE)) {
+  library(ggalign)
+  layout <- align() |> pack_right(width = 0.18)
+  out <- layout |> insert(p_main) |> insert(p_right, target = "right")
+  print(out)
+} else {
+  library(patchwork)
+  final_plot <- p_main + p_right + plot_layout(widths = c(1, 0.18))
+  print(final_plot)
+}
